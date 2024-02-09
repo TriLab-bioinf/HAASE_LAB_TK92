@@ -1,0 +1,562 @@
+---
+title: "Investigate the effect of YTHDF2 on target mRNA abundance using RNA-seq"
+author: "Analysis done by Yuejun Wang, TriLab Biounformatic Group"
+output:
+  html_document:
+  pdf_document: default
+  df_print: paged
+gemoetry: margin=1in
+fontsize: 8pt
+fontfamily: mathpazo
+---
+
+\center
+
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, tidy = TRUE)
+```
+
+# Load libraries
+```{r message=FALSE}
+
+options(java.parameters = "-Xmx8000m")
+
+library(tidyverse)
+library(DESeq2)
+library(org.Hs.eg.db)
+library(reshape2)
+library(ComplexHeatmap)
+library(enrichR)
+library(ggthemes)
+library(xlsx)
+library(r2excel)
+library(UpSetR)
+library(ggpubr)
+```
+
+# Load data
+```{r}
+metadata <- as.data.frame(read_tsv(file = "../SampleInfo.txt", col_names = TRUE, comment = "#"))
+rownames(metadata) <- metadata$SampleName
+
+
+read_counts <- as.data.frame(read_tsv(file = "/gpfs/gsfs12/users/wangy80/TK87/results/05counts/read_counts", col_names = TRUE, comment = "#"))
+rownames(read_counts) <- read_counts$Geneid # adding gene ids as row names
+
+genelength <- data.frame(gene=read_counts$Geneid,length=read_counts$Length)
+
+# Rename sample names
+read_counts <- read_counts[,7:length(read_counts)]
+
+colnames(read_counts) <- gsub(".sorted.dedup.bam","",
+                              gsub("results/04dedup/","",
+                                   colnames(read_counts)))
+
+
+# Sort tables so metadata and read counts match order
+read_counts <- read_counts[,match(metadata$SampleName, colnames(read_counts))]
+all(rownames(metadata) == colnames(read_counts))
+
+
+# Round read counts to the closest interger
+read_counts <- round(read_counts, digits = 0)
+
+# include total read counts in metadata
+metadata$read_counts <- colSums(read_counts)
+
+# Rename column names in read_counts based on metadata
+colnames(read_counts) <- rownames(metadata)
+
+write.table(x = metadata, file = "metadata.txt", sep = "\t") 
+```
+### calculate TPM
+
+```{r}
+# Process one column at a time.
+tpm <- do.call(cbind, lapply(1:ncol(read_counts), function(i) {
+    rate = log(read_counts[,i]) - log(genelength[,2])
+    denom = log(sum(exp(rate)))
+    exp(rate - denom + log(1e6))
+  }))
+
+# Copy the row and column names from the original matrix.
+colnames(tpm) <- colnames(read_counts)
+rownames(tpm) <- rownames(read_counts)
+tpm <- as.data.frame(tpm)
+```
+
+
+### get GeneName id
+
+```{r}
+## import emsembl-GeneName information
+info <- read.delim("/data/wangy80/TK87/data/00ref/ensembl-symbol.txt",sep="\t")
+names(info) <- c("GeneID","GeneName")
+
+# Add gene GeneNames
+tpm$GeneID <- rownames(tpm)
+
+res <- inner_join(tpm,info,by="GeneID")
+
+```
+
+```{r}
+## get mean of expression for each GeneName if multiple Ensembl IDs mapped to one GeneName 
+res.m <- melt(res[,-10])
+res.m2 <- res.m %>% group_by(GeneName,variable) %>% 
+  summarise(mean=mean(value))
+
+res2 <- res.m2 %>%
+  pivot_wider(names_from = variable, values_from = mean)
+
+df <- as.data.frame(res2)
+
+write.table(df,"TPM.txt",sep="\t",row.names=F,quote=F) 
+
+
+### filter genes by TPM total > 10 in YTHDF2
+df.sel <- df[which(rowSums(df[,2:4])>10),]
+
+```
+
+### PAR-CLIP
+
+```{r}
+## Nuc
+Nuc <- read.csv("WT_Low_Nuc.clusters.csv")
+
+Nuc.tpm <- Nuc %>% 
+  dplyr::select(GeneName, ConversionEventCount) %>% 
+  filter(GeneName!="") %>% 
+  group_by(GeneName) %>%
+  summarise(NX=sum(ConversionEventCount)) %>% 
+  right_join(df.sel,by="GeneName") %>%
+  as.data.frame()
+
+## calculated NXTPM (number of cross links normalized with TPM)
+#formula: NX*10^6/(sum(NX)*mean(TPM))
+
+Nuc.tpm[is.na(Nuc.tpm$NX),]$NX <- 0
+
+for(i in 1:dim(Nuc.tpm)[1]){
+  Nuc.tpm$NXTPM[i] <- 10^6*Nuc.tpm$NX[i]/(mean(c(Nuc.tpm[i,3],Nuc.tpm[i,4],Nuc.tpm[i,5]))*sum(Nuc.tpm$NX))
+}
+
+## class classification by NXTPM
+Nuc.tpm$class <- case_when(
+                    Nuc.tpm$NXTPM>quantile(Nuc.tpm[Nuc.tpm$NXTPM>0,]$NXTPM,0.9,na.rm=TRUE)  ~ "top10%",
+                    Nuc.tpm$NXTPM>quantile(Nuc.tpm[Nuc.tpm$NXTPM>0,]$NXTPM,0.8,na.rm=TRUE)  ~ "top10%~20%",
+                    Nuc.tpm$NXTPM>quantile(Nuc.tpm[Nuc.tpm$NXTPM>0,]$NXTPM,0.7,na.rm=TRUE)  ~ "top20%~30%",
+                    Nuc.tpm$NXTPM>quantile(Nuc.tpm[Nuc.tpm$NXTPM>0,]$NXTPM,0.5,na.rm=TRUE)  ~ "top30%~50%",
+                    Nuc.tpm$NXTPM>=quantile(Nuc.tpm[Nuc.tpm$NXTPM>0,]$NXTPM,0,na.rm=TRUE)  ~ "bottom50%",
+                    TRUE ~ "unbound"
+                           )
+
+
+## Cyt
+Cyt <- read.csv("WT_Low_Cyt.clusters.csv")
+
+Cyt.tpm <- Cyt %>% 
+  dplyr::select(GeneName, ConversionEventCount) %>% 
+  filter(GeneName!="") %>% 
+  group_by(GeneName) %>%
+  summarise(NX=sum(ConversionEventCount)) %>% 
+  right_join(df.sel,by="GeneName") %>%
+  as.data.frame()
+
+## calculated NXTPM (number of cross links normalized with TPM)
+#formula: NX*10^6/(sum(NX)*mean(TPM))
+
+Cyt.tpm[is.na(Cyt.tpm$NX),]$NX <- 0
+
+for(i in 1:dim(Cyt.tpm)[1]){
+  Cyt.tpm$NXTPM[i] <- 10^6*Cyt.tpm$NX[i]/(mean(c(Cyt.tpm[i,3],Cyt.tpm[i,4],Cyt.tpm[i,5]))*sum(Cyt.tpm$NX))
+}
+
+## class classification by NXTPM
+Cyt.tpm$class <- case_when(
+                    Cyt.tpm$NXTPM>quantile(Cyt.tpm[Cyt.tpm$NXTPM>0,]$NXTPM,0.9,na.rm=TRUE)  ~ "top10%",
+                    Cyt.tpm$NXTPM>quantile(Cyt.tpm[Cyt.tpm$NXTPM>0,]$NXTPM,0.8,na.rm=TRUE)  ~ "top10%~20%",
+                    Cyt.tpm$NXTPM>quantile(Cyt.tpm[Cyt.tpm$NXTPM>0,]$NXTPM,0.7,na.rm=TRUE)  ~ "top20%~30%",
+                    Cyt.tpm$NXTPM>quantile(Cyt.tpm[Cyt.tpm$NXTPM>0,]$NXTPM,0.5,na.rm=TRUE)  ~ "top30%~50%",
+                    Cyt.tpm$NXTPM>=quantile(Cyt.tpm[Cyt.tpm$NXTPM>0,]$NXTPM,0,na.rm=TRUE)  ~ "bottom50%",
+                    TRUE ~ "unbound"
+                           )
+
+```
+
+
+### NXTPM >50 heatmap
+
+```{r}
+## cyt
+rownames(Cyt.tpm) <- Cyt.tpm$GeneName
+df1 <- Cyt.tpm[which(Cyt.tpm$NXTPM>50),]
+
+rownames(df1) <- df1$GeneName
+
+write.table(df1,"Cyt_NXTPM_gt50_TPM.txt",row.names=F,sep="\t",quote=F)
+
+res.Cyt <- t(scale(t(df1[,3:(ncol(df1)-2)])))
+
+p1 <- Heatmap(res.Cyt, 
+      name="zscore",
+      show_row_names = TRUE
+      #col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+      )
+
+pdf("Cyt_NXTPM_gt50_expression_zscore.pdf",height=12,width=10)
+p1
+dev.off()
+
+p1
+
+
+## Nuc
+rownames(Nuc.tpm) <- Nuc.tpm$GeneName
+df2 <- Nuc.tpm[which(Nuc.tpm$NXTPM>50),]
+
+rownames(df2) <- df2$GeneName
+
+write.table(df2,"Nuc_NXTPM_gt50_TPM.txt",row.names=F,sep="\t",quote=F)
+
+res.Nuc <- t(scale(t(df2[,3:(ncol(df2)-2)])))
+
+p2 <- Heatmap(res.Nuc, 
+      name="zscore",
+      show_row_names = TRUE
+      #col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+      )
+
+pdf("Nuc_NXTPM_gt50_expression_zscore.pdf",height=15,width=14)
+p2
+dev.off()
+
+p2
+
+```
+
+# Run DE analysis
+```{r}
+
+# DE analysis with DESeq2
+dds <- DESeqDataSetFromMatrix(countData = read_counts, 
+                              colData = metadata,  
+                              design = ~ Sample)
+
+dds <- DESeq(dds)
+
+comparisons <- list(
+c("Sample","YTHDF2mut","HEK293"),
+c("Sample","YTHDF2","HEK293"),
+c("Sample","YTHDF2","YTHDF2mut")
+)
+
+```
+
+
+```{r}
+# Define function for processing and saving result tables
+# Using lfcShrink instead of results to reduce high Log2FC bias of genes with low expression
+
+get_deseq_result <- function(dds, contrast, analysis_type = "ashr"){
+  #print(1)
+  if(analysis_type %in% c("ashr","apeglm","normal")){
+    res <- lfcShrink(dds = dds, contrast =list(contrast), type = analysis_type)
+  } else if (analysis_type == "result"){
+    res <- results(object = dds, contrast = contrast, independentFiltering = FALSE)
+  }
+  # Replace NAs by 1s
+  res$pvalue[is.na(res$pvalue)] <- 1
+  res$padj[is.na(res$padj)] <- 1
+  # Print out summary of results
+  print(contrast)
+  summary(res, alpha = 0.05)
+  return(res)
+}
+```
+
+
+
+```{r}
+DE_results = list()
+for (i in 1:length(comparisons)){
+  print(i)
+  id <- paste0(comparisons[[i]], collapse = "_")
+  DE_results[[id]] <- get_deseq_result(dds = dds, contrast = comparisons[[i]], analysis_type = "result" )
+}  
+
+YTHDF2_HEK293 <- as.data.frame(DE_results$Sample_YTHDF2_HEK293)
+YTHDF2_HEK293$GeneID <- rownames(YTHDF2_HEK293)
+YTHDF2mut_HEK293 <- as.data.frame(DE_results$Sample_YTHDF2mut_HEK293)
+YTHDF2mut_HEK293$GeneID <- rownames(YTHDF2mut_HEK293)
+YTHDF2_YTHDF2mut <- as.data.frame(DE_results$Sample_YTHDF2_YTHDF2mut)
+YTHDF2_YTHDF2mut$GeneID <- rownames(YTHDF2_YTHDF2mut)
+```
+
+### plot
+
+```{r}
+plt <- function(comparison=comparion,data=data,out=out,limit=c(-1,1),ratio=2){
+  tmp1 <- inner_join(comparison,info,by="GeneID")
+  tmp2 <- inner_join(data,tmp1,by="GeneName")
+
+  tmp2 <- tmp2[order(tmp2$log2FoldChange), ]
+  tmp2$ecdf <- ave(tmp2$log2FoldChange, tmp2$class, FUN=function(x) seq_along(x)/length(x))
+  tmp2$class <- factor(tmp2$class,level=c("top10%","top10%~20%","top20%~30%","top30%~50%","bottom50%","unbound"))
+  
+  ### cdf plot
+  p1 <- ggplot(tmp2, aes(log2FoldChange, ecdf, colour = class)) +
+    ylab("Fraction of genes") + ggtitle(out) +
+    geom_line() +
+    xlim(limit) +
+    theme_classic() +
+    scale_color_brewer(palette="Set1") +
+    #coord_cartesian(expand = FALSE, xlim = limit, ylim = c(0, 1))+ 
+    geom_hline(yintercept=1, linetype="dashed", color = "#C0C0C0") +
+    coord_fixed(expand = FALSE, xlim = limit, ylim = c(0, 1),ratio =ratio)
+
+  pdf(paste0(out,"_cdfplot.pdf"),height=3.5,width=5)
+  plot(p1)
+  dev.off()
+
+  comp_class <- c("top10%","top10%~20%","top20%~30%","top30%~50%","bottom50%")
+  pvalues <- data.frame()
+  for(i in 1:length(comp_class)){
+    test <-ks.test(log2FoldChange~class,data=tmp2,subset = class %in% c("unbound",comp_class[i]))
+    pvalues[1,1] <- "class"
+    pvalues[1,2] <- "pvalue"
+    pvalues[i+1,1] <- comp_class[i]
+    pvalues[i+1,2] <- test$p.value
+  }
+  write.table(pvalues,paste0(out,".ks.test.txt"),sep="\t",quote=F,row.names=F,col.names=F)
+  
+  
+  ### boxplot
+  p2 <- ggboxplot(tmp2,"class","log2FoldChange",outlier.shape = NA) +
+    stat_compare_means(ref.group="unbound",label="p.signif") +
+    ylim(c(-1,1))+
+    theme(axis.text.x = element_text(
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5))
+  pdf(paste0(out,"_boxplot.pdf"),height=4,width=5)
+  plot(p2)
+  dev.off()
+  
+  ### density plot
+  p3 <- ggplot(tmp2,aes(log2FoldChange,colour=class)) + 
+    geom_density() +xlim(-1, 1)
+  pdf(paste0(out,"_density.pdf"),height=4,width=5)
+  plot(p3)
+  dev.off()
+}
+
+```
+
+```{r}
+plt(comparison=YTHDF2_HEK293,data=Nuc.tpm,out="Nuc_YTHDF2_vs_HEK293",limit=c(-1,1),ratio=2)
+plt(comparison=YTHDF2_HEK293,data=Cyt.tpm,out="Cyt_YTHDF2_vs_HEK293",limit=c(-1,1),ratio=2)
+plt(comparison=YTHDF2mut_HEK293,data=Nuc.tpm,out="Nuc_YTHDF2mut_vs_HEK293",limit=c(-1,1),ratio=2)
+plt(comparison=YTHDF2mut_HEK293,data=Cyt.tpm,out="Cyt_YTHDF2mut_vs_HEK293",limit=c(-1,1),ratio=2)
+plt(comparison=YTHDF2_YTHDF2mut,data=Nuc.tpm,out="Nuc_YTHDF2_vs_YTHDF2mut",limit=c(-0.5,0.5),ratio=1)
+plt(comparison=YTHDF2_YTHDF2mut,data=Cyt.tpm,out="Cyt_YTHDF2_vs_YTHDF2mut",limit=c(-0.5,0.5),ratio=1)
+```
+
+
+### function enrichment
+
+```{r}
+websiteLive <- getOption("enrichR.live")
+setEnrichrSite("Enrichr") # human genes   
+```
+
+### enrichr
+
+```{r}
+
+dbs <- c("GO_Molecular_Function_2023", "GO_Cellular_Component_2023", "GO_Biological_Process_2023","KEGG_2021")
+
+file_name = "Functional_enrichment.xlsx"
+fun_enrich <- function(list=list,out=out){
+    enriched <- enrichr(list, dbs)
+    res <- rbind(enriched[[1]],
+                enriched[[2]],
+                enriched[[3]],
+                enriched[[4]])
+    res2 <- res[which(res$Adjusted.P.value<0.05),]
+    res3 <- res2[order(res2$Adjusted.P.value),]
+    # barplot
+    options(repr.plot.width = 8, repr.plot.height = 6, repr.plot.res = 200)
+    res3$GeneCount <- as.numeric(gsub("/.*$","",res3$Overlap))
+    res3$class <-out
+    if(dim(res3)[1]<20){
+      p<-ggplot(data=res3, aes(x=reorder(Term,-Adjusted.P.value), y=GeneCount,fill=Adjusted.P.value)) +
+      geom_bar(stat = "identity")
+    }
+    else {
+      p<-ggplot(data=res3[1:20,], aes(x=reorder(Term,-Adjusted.P.value), y=GeneCount,fill=Adjusted.P.value)) +
+      geom_bar(stat = "identity")
+    }
+    # Horizontal bar plot
+    p2 <- p + coord_flip() + scale_fill_gradient(low = "red", high = "yellow") +theme_few() + xlab('Enriched Terms') +ggtitle(out)
+    ggsave(paste0("Plots/",out,"_barplot.png"),p2,width=14,height=5)
+    
+    # write outputs
+    sheet_name = out
+        # Check if an excel spreadsheet already exists, otherwise create one
+    if(file.exists(file_name)){
+      wb <- loadWorkbook(file = file_name)
+    } else {
+      wb <- createWorkbook(type="xlsx")
+    }
+  
+    # Create new excel sheet, remove sheets if it already exits (if the sheet name is too long, the errors might occur)
+    sheets <- getSheets(wb)
+    if(is.element(sheet_name,names(sheets))){
+      removeSheet(wb, sheetName=sheet_name)
+    }
+    sheet <- createSheet(wb, sheetName = sheet_name)
+    xlsx.addTable(wb = wb, sheet = sheet, data = res3, startRow = 1, startCol = 1)
+    # Write sorted table to Excel file as different worksheets. Need file name + Worksheet name !!!
+    saveWorkbook(wb, file_name)
+    return(res3[1:10,])
+}
+
+```
+
+
+```{r}
+for (i in names(DE_results)){
+    up <- as.data.frame(subset(DE_results[[i]],log2FoldChange > 1 & padj <= 0.05))
+    up$GeneID <- rownames(up)
+    up2 <- inner_join(up,info,by="GeneID")
+    up_Nuc_bound <- inner_join(up2,subset(Nuc.tpm,class!="unbound"),by="GeneName")
+    sel <- up_Nuc_bound$GeneName
+    assign(gsub("Sample_","",paste0(i,"_up_Cyt_bound")),fun_enrich(sel,gsub("Sample_","",paste0(i,"_up_Nuc_bound"))))
+    up_Cyt_bound <- inner_join(up2,subset(Cyt.tpm,class!="unbound"),by="GeneName")
+    sel2 <- up_Cyt_bound$GeneName
+    assign(gsub("Sample_","",paste0(i,"_up_Cyt_bound")),fun_enrich(sel2,gsub("Sample_","",paste0(i,"_up_Cyt_bound"))))
+}
+
+for (i in names(DE_results)){
+    down <- as.data.frame(subset(DE_results[[i]],log2FoldChange < -1 & padj <= 0.05))
+    down$GeneID <- rownames(down)
+    down2 <- inner_join(down,info,by="GeneID")
+    down_Nuc_bound <- inner_join(down2,subset(Nuc.tpm,class!="unbound"),by="GeneName")
+    sel <- down_Nuc_bound$GeneName
+    assign(gsub("Sample_","",paste0(i,"_down_Nuc_bound")),fun_enrich(sel,gsub("Sample_","",paste0(i,"_down_Nuc_bound"))))
+    down_Cyt_bound <- inner_join(down2,subset(Cyt.tpm,class!="unbound"),by="GeneName")
+    sel2 <- down_Cyt_bound$GeneName
+    assign(gsub("Sample_","",paste0(i,"_down_Cyt_bound")),fun_enrich(sel2,gsub("Sample_","",paste0(i,"_down_Cyt_bound"))))
+}
+```
+
+### merge functional terms
+
+```{r}
+
+## merge down regulated genes
+down.enrich <- rbind(YTHDF2_HEK293_down_Cyt_bound,
+              YTHDF2_HEK293_down_Nuc_bound,
+              YTHDF2mut_HEK293_down_Cyt_bound,
+              YTHDF2mut_HEK293_down_Nuc_bound,
+              YTHDF2_YTHDF2mut_down_Cyt_bound,
+              YTHDF2_YTHDF2mut_down_Nuc_bound)
+
+down.enrich <- down.enrich[!is.na(down.enrich$Term),]
+p1 <- ggplot(down.enrich, aes(x= class, y=Term, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
+  geom_point() + 
+  scale_color_gradient(low = "red2",  high = "yellow", space = "Lab", limit = c(0, 0.05)) +
+  scale_size(range = c(1, 8))+
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey60", linetype = "dashed"),
+    axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)
+  ) 
+
+ggsave(paste0("Plots/","down_FuncEnrich_barplot.pdf"),p1,width=10,height=10)
+
+
+## merge up regulated genes   
+up.enrich <- rbind(YTHDF2_HEK293_up_Cyt_bound,
+              YTHDF2mut_HEK293_up_Cyt_bound,
+              YTHDF2_YTHDF2mut_up_Cyt_bound)
+
+up.enrich <- up.enrich[!is.na(up.enrich$Term),]
+p2 <- ggplot(up.enrich, aes(x= class, y=Term, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
+  geom_point() + 
+  scale_color_gradient(low = "red2",  high = "yellow", space = "Lab", limit = c(0, 0.05)) +
+  scale_size(range = c(1, 8))+
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey60", linetype = "dashed"),
+    axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)
+  ) 
+
+ggsave(paste0("Plots/","up_FuncEnrich_barplot.pdf"),p2,width=10,height=8)
+
+```
+
+# genelists overlap
+
+```{r}
+genelist <- list()
+for (i in names(DE_results)){
+    up <- as.data.frame(subset(DE_results[[i]],log2FoldChange > 1 & padj <= 0.05))
+    up$GeneID <- rownames(up)
+    up2 <- inner_join(up,info,by="GeneID")
+    name <- paste0(i,"_up")
+    genelist[[name]] <- up2$GeneName
+    down <- as.data.frame(subset(DE_results[[i]],log2FoldChange < -1 & padj <= 0.05))
+    down$GeneID <- rownames(down)
+    down2 <- inner_join(down,info,by="GeneID")
+    name2 <- paste0(i,"_down")
+    genelist[[name2]] <- down2$GeneName
+}
+
+
+
+genelist[["Nuc_bound"]] <- rownames(subset(Nuc.tpm,class!="unbound"))
+genelist[["Cyt_bound"]] <- rownames(subset(Cyt.tpm,class!="unbound"))
+
+
+m = make_comb_mat(genelist)
+p <- UpSet(m,top_annotation = upset_top_annotation(m, add_numbers = TRUE),
+    right_annotation = upset_right_annotation(m, add_numbers = TRUE))
+
+pdf("./Plots/overlap_DEs_bound_NXTPM.pdf",height=5,width=10)
+p
+dev.off()
+
+```
+## list to matrix
+
+```{r}
+library(splitstackshape)
+
+out <- as.data.frame(t(splitstackshape:::charMat(listOfValues = genelist, fill = 0L)))
+colnames(out) <- names(genelist)
+
+out$GeneName <- rownames(out)
+
+#put all data frames into list
+df_list <- list(out, Nuc.tpm[,c(1,12,13)], Cyt.tpm[,c(1,12,13)])
+
+#merge all data frames in list
+out2 <- df_list %>% purrr::reduce(full_join, by='GeneName')
+
+write.table(out2,"genelist.matrix.txt",sep="\t",quote=F)
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
