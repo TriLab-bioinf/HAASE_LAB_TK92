@@ -434,7 +434,7 @@ for (i in names(DE_results)){
     up2 <- inner_join(up,info,by="GeneID")
     up_Nuc_bound <- inner_join(up2,subset(Nuc.tpm,class!="unbound"),by="GeneName")
     sel <- up_Nuc_bound$GeneName
-    assign(gsub("Sample_","",paste0(i,"_up_Cyt_bound")),fun_enrich(sel,gsub("Sample_","",paste0(i,"_up_Nuc_bound"))))
+    assign(gsub("Sample_","",paste0(i,"_up_Nuc_bound")),fun_enrich(sel,gsub("Sample_","",paste0(i,"_up_Nuc_bound"))))
     up_Cyt_bound <- inner_join(up2,subset(Cyt.tpm,class!="unbound"),by="GeneName")
     sel2 <- up_Cyt_bound$GeneName
     assign(gsub("Sample_","",paste0(i,"_up_Cyt_bound")),fun_enrich(sel2,gsub("Sample_","",paste0(i,"_up_Cyt_bound"))))
@@ -466,7 +466,9 @@ down.enrich <- rbind(YTHDF2_HEK293_down_Cyt_bound,
               YTHDF2_YTHDF2mut_down_Nuc_bound)
 
 down.enrich <- down.enrich[!is.na(down.enrich$Term),]
-p1 <- ggplot(down.enrich, aes(x= class, y=Term, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
+p1 <- down.enrich %>%
+  mutate(name = fct_reorder(Term, -sort(Adjusted.P.value))) %>%
+  ggplot(aes(x= class, y=name, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
   geom_point() + 
   scale_color_gradient(low = "red2",  high = "yellow", space = "Lab", limit = c(0, 0.05)) +
   scale_size(range = c(1, 8))+
@@ -483,11 +485,16 @@ ggsave(paste0("Plots/","down_FuncEnrich_barplot.pdf"),p1,width=10,height=10)
 
 ## merge up regulated genes   
 up.enrich <- rbind(YTHDF2_HEK293_up_Cyt_bound,
+              YTHDF2_HEK293_up_Nuc_bound,
               YTHDF2mut_HEK293_up_Cyt_bound,
-              YTHDF2_YTHDF2mut_up_Cyt_bound)
+              YTHDF2mut_HEK293_up_Nuc_bound,
+              YTHDF2_YTHDF2mut_up_Cyt_bound,
+              YTHDF2_YTHDF2mut_up_Nuc_bound)
 
 up.enrich <- up.enrich[!is.na(up.enrich$Term),]
-p2 <- ggplot(up.enrich, aes(x= class, y=Term, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
+p2 <- up.enrich %>%
+  mutate(name = fct_reorder(Term, -sort(Adjusted.P.value))) %>%
+  ggplot(aes(x= class, y=name, size=log10(Odds.Ratio), color=Adjusted.P.value)) + 
   geom_point() + 
   scale_color_gradient(low = "red2",  high = "yellow", space = "Lab", limit = c(0, 0.05)) +
   scale_size(range = c(1, 8))+
@@ -499,7 +506,7 @@ p2 <- ggplot(up.enrich, aes(x= class, y=Term, size=log10(Odds.Ratio), color=Adju
     axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)
   ) 
 
-ggsave(paste0("Plots/","up_FuncEnrich_barplot.pdf"),p2,width=10,height=8)
+ggsave(paste0("Plots/","up_FuncEnrich_barplot.pdf"),p2,width=10,height=10)
 
 ```
 
